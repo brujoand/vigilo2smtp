@@ -78,7 +78,12 @@ def save_seen(state_file: Path, seen: set) -> None:
 
 
 def send_email(
-    smtp_host: str, smtp_port: int, from_addr: str, to_addr: str, subject: str, body: str
+    smtp_host: str,
+    smtp_port: int,
+    from_addr: str,
+    to_addr: str,
+    subject: str,
+    body: str,
 ) -> None:
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
@@ -135,7 +140,9 @@ class VigiloClient:
 def format_email_body(thread: dict, messages: list) -> str:
     lines = []
     sender = thread.get("sender", {})
-    sender_name = sender.get("name", "Unknown") if isinstance(sender, dict) else str(sender)
+    sender_name = (
+        sender.get("name", "Unknown") if isinstance(sender, dict) else str(sender)
+    )
     org = thread.get("organizationalUnit", {})
     org_name = org.get("name", "") if isinstance(org, dict) else str(org)
 
@@ -148,7 +155,9 @@ def format_email_body(thread: dict, messages: list) -> str:
         body = msg.get("body", "")
         created = msg.get("timeCreated", "")
         msg_sender = msg.get("sender", {})
-        msg_sender_name = msg_sender.get("name", "") if isinstance(msg_sender, dict) else ""
+        msg_sender_name = (
+            msg_sender.get("name", "") if isinstance(msg_sender, dict) else ""
+        )
         lines.append(f"--- {msg_sender_name} ({created}) ---")
         lines.append(body)
         lines.append("")
@@ -172,7 +181,10 @@ def main() -> None:
         print("ERROR: VIGILO_USER_ID not set", file=sys.stderr)
         sys.exit(1)
     if not CLIENT_ID or not CLIENT_SECRET:
-        print("ERROR: VIGILO_CLIENT_ID and VIGILO_CLIENT_SECRET must be set", file=sys.stderr)
+        print(
+            "ERROR: VIGILO_CLIENT_ID and VIGILO_CLIENT_SECRET must be set",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     tokens = load_tokens(token_file)
@@ -193,7 +205,8 @@ def main() -> None:
                 print("Refresh token expired — alert email sent.")
             except Exception as mail_err:
                 print(
-                    f"Refresh token expired and could not send alert: {mail_err}", file=sys.stderr
+                    f"Refresh token expired and could not send alert: {mail_err}",
+                    file=sys.stderr,
                 )
             sys.exit(0)
         raise
