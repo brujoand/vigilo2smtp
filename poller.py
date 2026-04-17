@@ -233,7 +233,10 @@ def main() -> None:
                 emails_sent += 1
                 print(f"Emailed thread: {title}")
             except Exception as e:
-                print(f"Failed to send email for thread {thread_uid}: {e}", file=sys.stderr)
+                print(
+                    f"Failed to send email for thread {thread_uid}: {e}",
+                    file=sys.stderr,
+                )
 
     finally:
         client.close()
