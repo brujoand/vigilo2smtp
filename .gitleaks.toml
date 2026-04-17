@@ -1,0 +1,10 @@
+[extend]
+# Extend the default gitleaks config
+useDefault = true
+
+[[allowlists]]
+description = "Vigilo APK client credentials are public (extracted from a published Android app) but must be injected via environment variables, not hardcoded"
+regexes = [
+  'fc442667-55b1-4072-ad4d-937133874514',
+  'a08d178c-ff65-4e4b-9133-45fa9546438b',
+]
