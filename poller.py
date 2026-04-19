@@ -4,14 +4,13 @@ Vigilo message poller.
 
 Reads credentials from environment variables, polls for new message threads,
 and forwards them via SMTP. Tracks seen thread IDs in a statefile to avoid
-duplicate emails.
+duplicate emails. Attachments are downloaded and included in the email.
 
 Environment variables required:
     VIGILO_CLIENT_ID      - OAuth client ID (extracted from Android APK)
     VIGILO_CLIENT_SECRET  - OAuth client secret (extracted from Android APK)
-    VIGILO_ACCESS_TOKEN   - current OAuth access token
-    VIGILO_REFRESH_TOKEN  - OAuth refresh token (persisted back to token file)
-    VIGILO_USER_ID        - Vigilo user ID (sub claim from JWT)
+    VIGILO_ACCESS_TOKEN   - current OAuth access token (only used if no token file)
+    VIGILO_REFRESH_TOKEN  - OAuth refresh token (only used if no token file)
     SMTP_HOST             - SMTP relay host (default: smtp-relay.automation.svc.cluster.local)
     SMTP_PORT             - SMTP relay port (default: 25)
     SMTP_FROM             - sender address (default: post@brujordet.no)
@@ -25,6 +24,9 @@ import json
 import os
 import smtplib
 import sys
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -52,6 +54,12 @@ def refresh_token(refresh_tok: str) -> dict:
     return r.json()
 
 
+def user_id_from_jwt(access_token: str) -> str:
+    payload = access_token.split(".")[1]
+    payload += "==" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))["sub"]
+
+
 def load_tokens(token_file: Path) -> dict:
     if token_file.exists():
         return json.loads(token_file.read_text())
@@ -77,6 +85,12 @@ def save_seen(state_file: Path, seen: set) -> None:
     state_file.write_text(json.dumps(list(seen)))
 
 
+def download_attachment(url: str) -> bytes:
+    r = httpx.get(url, timeout=60, follow_redirects=True)
+    r.raise_for_status()
+    return r.content
+
+
 def send_email(
     smtp_host: str,
     smtp_port: int,
@@ -84,8 +98,21 @@ def send_email(
     to_addr: str,
     subject: str,
     body: str,
+    attachments: list,
 ) -> None:
-    msg = MIMEText(body, "plain", "utf-8")
+    if attachments:
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        for name, mime_type, data in attachments:
+            main_type, sub_type = mime_type.split("/", 1)
+            part = MIMEBase(main_type, sub_type)
+            part.set_payload(data)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=name)
+            msg.attach(part)
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
+
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_addr
@@ -139,16 +166,11 @@ class VigiloClient:
 
 def format_email_body(thread: dict, messages: list) -> str:
     lines = []
-    sender = thread.get("sender", {})
-    sender_name = (
-        sender.get("name", "Unknown") if isinstance(sender, dict) else str(sender)
-    )
     org = thread.get("organizationalUnit", {})
     org_name = org.get("name", "") if isinstance(org, dict) else str(org)
 
     if org_name:
         lines.append(f"School: {org_name}")
-    lines.append(f"From: {sender_name}")
     lines.append("")
 
     for msg in messages:
@@ -156,10 +178,15 @@ def format_email_body(thread: dict, messages: list) -> str:
         created = msg.get("timeCreated", "")
         msg_sender = msg.get("sender", {})
         msg_sender_name = (
-            msg_sender.get("name", "") if isinstance(msg_sender, dict) else ""
+            f"{msg_sender.get('firstName', '')} {msg_sender.get('lastName', '')}".strip()
+            if isinstance(msg_sender, dict)
+            else ""
         )
         lines.append(f"--- {msg_sender_name} ({created}) ---")
         lines.append(body)
+        att_list = msg.get("attachments", [])
+        if att_list:
+            lines.append(f"Attachments: {', '.join(a['name'] for a in att_list)}")
         lines.append("")
 
     return "\n".join(lines)
@@ -172,13 +199,9 @@ def main() -> None:
     smtp_to = os.environ.get("SMTP_TO", "")
     state_file = Path(os.environ.get("STATE_FILE", "/data/seen.json"))
     token_file = Path(os.environ.get("TOKEN_FILE", "/data/tokens.json"))
-    user_id = os.environ.get("VIGILO_USER_ID", "")
 
     if not smtp_to:
         print("ERROR: SMTP_TO not set", file=sys.stderr)
-        sys.exit(1)
-    if not user_id:
-        print("ERROR: VIGILO_USER_ID not set", file=sys.stderr)
         sys.exit(1)
     if not CLIENT_ID or not CLIENT_SECRET:
         print(
@@ -201,7 +224,7 @@ def main() -> None:
                 "See the vigilo2smtp repository for instructions."
             )
             try:
-                send_email(smtp_host, smtp_port, smtp_from, smtp_to, subject, body)
+                send_email(smtp_host, smtp_port, smtp_from, smtp_to, subject, body, [])
                 print("Refresh token expired — alert email sent.")
             except Exception as mail_err:
                 print(
@@ -211,6 +234,7 @@ def main() -> None:
             sys.exit(0)
         raise
 
+    user_id = user_id_from_jwt(tokens["access_token"])
     client = VigiloClient(tokens["access_token"], user_id)
     seen = load_seen(state_file)
     new_seen = set(seen)
@@ -240,8 +264,22 @@ def main() -> None:
             subject = f"[Vigilo] {title}"
             body = format_email_body(thread, messages)
 
+            attachments = []
+            for msg in messages:
+                for att in msg.get("attachments", []):
+                    try:
+                        data = download_attachment(att["url"])
+                        attachments.append((att["name"], att["mimeType"], data))
+                    except Exception as e:
+                        print(
+                            f"Failed to download attachment {att['name']}: {e}",
+                            file=sys.stderr,
+                        )
+
             try:
-                send_email(smtp_host, smtp_port, smtp_from, smtp_to, subject, body)
+                send_email(
+                    smtp_host, smtp_port, smtp_from, smtp_to, subject, body, attachments
+                )
                 new_seen.add(thread_uid)
                 emails_sent += 1
                 print(f"Emailed thread: {title}")
