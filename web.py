@@ -494,8 +494,15 @@ def make_handler(
                 return
 
             verifier = None
+            # How long ago this login was started. invalid_grant means "expired,
+            # already used, or mismatched" with no way to tell which apart, so
+            # the elapsed time is the one piece of evidence that separates a
+            # slow copy-paste from a structural problem.
+            started_ago = None
             if oauth_state:
                 entry = pending.peek(oauth_state)
+                if entry is not None:
+                    started_ago = int(time.time() - (entry.get("created") or 0))
                 if entry is None:
                     print("Re-auth rejected: unknown or expired state parameter.")
                     self._page(
@@ -521,9 +528,29 @@ def make_handler(
                 # The user sees this on the page, but the operator needs it in
                 # the log too -- an exchange that fails silently server-side is
                 # the hardest thing to diagnose remotely.
-                print(f"Re-auth token exchange failed: {e} {detail}")
+                age = (
+                    f"login started {started_ago}s ago"
+                    if started_ago is not None
+                    else "no state, so the login's age is unknown"
+                )
+                print(f"Re-auth token exchange failed ({age}): {e} {detail}")
+                hint = ""
+                if started_ago is not None and started_ago > 90:
+                    hint = (
+                        f"<br>That login was started <strong>{started_ago} seconds"
+                        "</strong> ago. Codes expire in about a minute, so this is "
+                        "almost certainly just too slow &mdash; open this page in a "
+                        "second tab first so the paste is immediate."
+                    )
+                elif started_ago is not None:
+                    hint = (
+                        f"<br>That login was only {started_ago}s old, so the code "
+                        "should still have been valid. It may already have been "
+                        "used &mdash; start a completely fresh login."
+                    )
                 self._page(
                     '<div class="card msg-err"><strong>Token exchange failed.</strong>'
+                    f"{hint}"
                     f"<br>{html.escape(str(e))}<br><code>{html.escape(detail)}</code>"
                     "<br>Auth codes expire in about a minute and work only once "
                     "&mdash; start over with the button above.</div>",
@@ -560,7 +587,8 @@ def make_handler(
 
             if oauth_state:
                 pending.consume(oauth_state)
-            print("Re-authentication complete; tokens saved.")
+            took = f" (login took {started_ago}s)" if started_ago is not None else ""
+            print(f"Re-authentication complete; tokens saved.{took}")
             self._page(
                 '<div class="card msg-ok"><strong>Tokens saved.</strong> '
                 "Polling resumes on the next cycle.</div>"

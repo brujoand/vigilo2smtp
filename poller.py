@@ -111,6 +111,11 @@ class AppState:
                 self.status = json.loads(self.status_file.read_text())
             except (OSError, ValueError):
                 self.status = {}
+        # Drop the log throttle marks on startup. They are meant to stop a
+        # steady state repeating every cycle, not to stop a fresh process
+        # stating the condition it woke up in -- which is the first thing
+        # anyone reads after a restart.
+        self.status.pop("log_marks", None)
 
     def _persist(self) -> None:
         write_json_atomic(self.status_file, self.status)
