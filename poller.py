@@ -558,17 +558,13 @@ def run_loop(cfg: Config, state: AppState, stop: threading.Event) -> None:
         stop.wait(cfg.poll_interval)
 
 
-def probe_redirect_uri(candidate: str) -> None:
-    """Log whether the auth server would accept ``candidate`` as a redirect_uri.
+def _authorize_probe(candidate: str) -> tuple[bool, str] | None:
+    """Ask the authorize endpoint about one redirect_uri.
 
-    Registered redirect URIs are an exact-match allowlist the provider
-    controls, and they are validated at the authorize endpoint *before* any
-    authentication -- so this is answerable with one unauthenticated request
-    and no login. It matters because an accepted https redirect replaces the
-    whole copy-paste flow with an ordinary callback, and the paste flow is
-    where every failure so far has happened.
-
-    Runs once at startup. Never raises: this is diagnostics, not a dependency.
+    Returns (looks_accepted, evidence), or None if the request could not be
+    made. Unauthenticated: registered redirect URIs are an exact-match
+    allowlist validated before any login, precisely so the server never
+    redirects to an unvetted URI.
     """
     try:
         r = httpx.get(
@@ -584,22 +580,75 @@ def probe_redirect_uri(candidate: str) -> None:
         )
     except Exception as e:
         print(f"redirect_uri probe for {candidate} could not run: {e}")
-        return
+        return None
 
     location = r.headers.get("location", "")
-    body = (r.text or "")[:200]
-    # An unregistered URI is refused outright rather than redirected to, since
-    # redirecting to an unvetted URI is the thing the allowlist exists to stop.
+    body = (r.text or "")[:400]
     rejected = r.status_code >= 400 or "invalid_request" in (location + body)
-    verdict = "REJECTED" if rejected else "ACCEPTED"
-    print(
-        f"redirect_uri probe: {candidate} -> {verdict} "
-        f"(HTTP {r.status_code}{', location=' + location[:120] if location else ''})"
-    )
-    if not rejected:
+    evidence = f"HTTP {r.status_code}"
+    if location:
+        evidence += f", location={location[:120]}"
+    return (not rejected, evidence)
+
+
+def probe_redirect_uri(candidate: str) -> None:
+    """Decide whether ``candidate`` is a usable redirect_uri, with controls.
+
+    A bare "the server did not obviously refuse" is not evidence: an error
+    page served with HTTP 200 looks identical to a login page. So the
+    candidate is only reported usable if a deliberately unregistered control
+    URI is refused -- proving the probe can tell the two apart -- and the
+    known-good custom scheme is accepted, proving the request shape is right.
+
+    Runs once at startup. Never raises: this is diagnostics, not a dependency.
+    """
+    bogus = "https://redirect-probe-control.invalid/cb"
+    results = {
+        name: _authorize_probe(uri)
+        for name, uri in (
+            ("candidate", candidate),
+            ("control-known-good", "app://ch-parent-android.vigilo.no"),
+            ("control-known-bad", bogus),
+        )
+    }
+    for name, res in results.items():
+        if res is None:
+            print(f"redirect_uri probe: {name} could not be evaluated")
+            return
         print(
-            "  This redirect is usable. Set VIGILO_REDIRECT_URI to it to replace "
-            "the copy-paste flow with an automatic callback."
+            f"redirect_uri probe: {name} -> {'ok' if res[0] else 'refused'} ({res[1]})"
+        )
+
+    cand_ok = results["candidate"][0]
+    good_ok = results["control-known-good"][0]
+    bad_ok = results["control-known-bad"][0]
+
+    if bad_ok:
+        # An unregistered URI was not refused, so "not refused" carries no
+        # information and the candidate's result means nothing either way.
+        print(
+            "redirect_uri probe: INCONCLUSIVE -- an unregistered control URI was "
+            "also accepted, so this endpoint does not reject at authorize time. "
+            "Do not switch VIGILO_REDIRECT_URI on this evidence."
+        )
+        return
+    if not good_ok:
+        print(
+            "redirect_uri probe: INCONCLUSIVE -- the known-good custom scheme was "
+            "refused, so the probe request itself is malformed."
+        )
+        return
+
+    if cand_ok:
+        print(
+            f"redirect_uri probe: CONCLUSIVE -- {candidate} is registered and "
+            "usable. Set VIGILO_REDIRECT_URI to it to replace the copy-paste "
+            "flow with an automatic callback."
+        )
+    else:
+        print(
+            f"redirect_uri probe: CONCLUSIVE -- {candidate} is not registered. "
+            "The copy-paste flow is required."
         )
 
 
