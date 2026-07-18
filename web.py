@@ -29,7 +29,7 @@ import os
 import secrets
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import poller
 
@@ -41,6 +41,16 @@ MAX_PENDING = 5
 # Auth codes are single-use; a double-submitted form would otherwise show a
 # confusing invalid_grant right after a success.
 RECENT_SUCCESS_WINDOW = 30
+
+# PKCE is OFF by default, which is not the usual advice and needs the reason
+# recorded. This client is confidential (it authenticates the token call with a
+# client secret) and the flow is a manual paste, so PKCE buys little. Against
+# that: the bare-code paste path carries no state, so there is no way to know
+# which verifier belongs to the pasted code -- any guess that misses turns a
+# working exchange into invalid_grant. The known-good reference flow for this
+# client sent no challenge at all. Opt in with VIGILO_USE_PKCE=1 if Vigilo ever
+# starts requiring it, and drop the bare-code path at the same time.
+USE_PKCE = os.environ.get("VIGILO_USE_PKCE", "").lower() in ("1", "true", "yes")
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -156,14 +166,6 @@ class PendingAuths:
         """
         if self._entries.pop(state, None) is not None:
             self._persist()
-
-    def any_verifier(self) -> str | None:
-        """Best-effort verifier for the bare-code path, where no state is known."""
-        self._prune()
-        if not self._entries:
-            return None
-        newest = max(self._entries.values(), key=lambda v: v.get("created", 0))
-        return newest.get("verifier")
 
 
 class CsrfTokens:
@@ -358,12 +360,19 @@ def make_handler(
                 "response_type": "code",
                 "scope": poller.SCOPE,
                 "state": oauth_state,
-                "code_challenge": challenge,
-                "code_challenge_method": "S256",
                 "prompt": "login",
                 "display": "touch",
             }
-            return f"{poller.AUTH_BASE}/connect/authorize?{urlencode(params)}"
+            if USE_PKCE:
+                params["code_challenge"] = challenge
+                params["code_challenge_method"] = "S256"
+            # quote_via=quote so the scope separator encodes as %20 rather than
+            # '+', byte-for-byte matching the authorize URL this client is known
+            # to accept.
+            return (
+                f"{poller.AUTH_BASE}/connect/authorize?"
+                f"{urlencode(params, quote_via=quote)}"
+            )
 
         def _page(self, message: str = "", code: int = 200) -> None:
             self._send(
@@ -396,6 +405,14 @@ def make_handler(
                 self._handle_callback()
             elif path == "/":
                 self._page()
+            elif path == "/reauth":
+                # The form is POST-only; landing here with a GET means a manual
+                # navigation or a refresh. Send them to the form rather than a
+                # dead-end 404.
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
             else:
                 self._send(404, b"not found\n", "text/plain; charset=utf-8")
 
@@ -446,6 +463,26 @@ def make_handler(
             # No state in a bare-code paste, so it cannot be required here.
             self._complete(code, extract_state(pasted), require_state=False)
 
+        def _exchange(self, code: str, verifier: str | None) -> dict:
+            """Redeem the code, retrying once without PKCE on invalid_grant.
+
+            A verifier that does not match the authorize request fails as
+            invalid_grant, which is indistinguishable from an expired code. The
+            retry costs one request and turns a dead end into a working login;
+            the code is single-use, so if the first attempt really did redeem
+            it, the retry simply fails the same way.
+            """
+            try:
+                return poller.exchange_code(code, verifier)
+            except Exception as e:
+                response = getattr(e, "response", None)
+                if not verifier or response is None:
+                    raise
+                if "invalid_grant" not in (response.text or ""):
+                    raise
+                print("Exchange failed with PKCE verifier; retrying without it.")
+                return poller.exchange_code(code, None)
+
         def _complete(self, code: str, oauth_state: str, require_state: bool) -> None:
             snap = state.snapshot()
             last_ok = snap.get("reauth_completed_at") or 0
@@ -467,17 +504,15 @@ def make_handler(
                         400,
                     )
                     return
-                verifier = entry.get("verifier")
+                verifier = entry.get("verifier") if USE_PKCE else None
             elif require_state:
                 self._page(
                     '<div class="card msg-err">Missing state parameter.</div>', 400
                 )
                 return
-            else:
-                verifier = pending.any_verifier()
 
             try:
-                tokens = poller.exchange_code(code, verifier)
+                tokens = self._exchange(code, verifier)
             except Exception as e:
                 detail = ""
                 response = getattr(e, "response", None)
