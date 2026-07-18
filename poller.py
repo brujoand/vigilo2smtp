@@ -61,6 +61,10 @@ SCOPE = "openid vigiloprofile offline_access"
 # runs every 5 minutes; without this it would mail on every cycle.
 REAUTH_EMAIL_INTERVAL = 24 * 60 * 60
 
+# How often a persistent condition (paused, refresh still failing) may re-log.
+# Long enough not to bury real events, short enough to see in a log tail.
+LOG_THROTTLE_INTERVAL = 30 * 60
+
 
 @dataclass
 class Config:
@@ -122,6 +126,22 @@ class AppState:
     def snapshot(self) -> dict:
         with self.lock:
             return dict(self.status)
+
+
+def log_throttled(state: AppState, key: str, message: str) -> None:
+    """Print at most once per LOG_THROTTLE_INTERVAL per key.
+
+    Steady-state conditions (paused, repeatedly failing refresh) need to be
+    visible in the log, but printing them every cycle would bury everything
+    else. Caller must hold ``state.lock``.
+    """
+    now = time.time()
+    marks = state.status.setdefault("log_marks", {})
+    if now - (marks.get(key) or 0) < LOG_THROTTLE_INTERVAL:
+        return
+    marks[key] = now
+    state.update(log_marks=marks)
+    print(message)
 
 
 def _basic_auth() -> str:
@@ -325,6 +345,14 @@ def notify_reauth_needed(cfg: Config, state: AppState) -> None:
         now = time.time()
         last = state.status.get("reauth_notified_at") or 0
         if now - last < REAUTH_EMAIL_INTERVAL:
+            # Suppressing the mail must not also suppress the fact that we are
+            # broken -- otherwise the second failure onwards is entirely silent.
+            log_throttled(
+                state,
+                "reauth-suppressed",
+                "Re-authentication still required; alert email suppressed "
+                f"(last sent {int((now - last) / 60)} min ago).",
+            )
             return
         # Claim the slot before sending, so two callers cannot both decide to
         # send. Rolled back below if the send fails, so a transient SMTP
@@ -361,7 +389,14 @@ def poll_once(cfg: Config, state: AppState) -> None:
     with state.lock:
         if state.status.get("needs_reauth"):
             # The UI clears this once new tokens are saved; until then there is
-            # nothing useful to do and every call would 401.
+            # nothing useful to do and every call would 401. Say so out loud --
+            # a paused poller that logs nothing is indistinguishable from a
+            # healthy idle one, which makes this state invisible in operation.
+            log_throttled(
+                state,
+                "paused",
+                "Paused: re-authentication required. Open the web UI to sign in again.",
+            )
             return
         state.update(last_poll_attempt=time.time())
 
