@@ -1,5 +1,10 @@
 FROM python:3.12-slim
 
+# Without this, a long-running process buffers stdout in 8KB blocks and its
+# logs never appear -- the short-lived predecessor got away with it because it
+# flushed on exit.
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 RUN pip install --no-cache-dir httpx
