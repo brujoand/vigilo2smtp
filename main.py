@@ -22,6 +22,13 @@ def main() -> None:
     state = poller.AppState(status_file=cfg.status_file)
     state.load()
 
+    # One unauthenticated request, answering whether the paste flow is
+    # necessary at all. Only meaningful while we are still on the custom
+    # scheme; once VIGILO_REDIRECT_URI is an https URL the answer is evidently
+    # yes and there is nothing left to probe.
+    if cfg.public_url and not poller.REDIRECT_URI.startswith("https://"):
+        poller.probe_redirect_uri(f"{cfg.public_url.rstrip('/')}/oauth/callback")
+
     stop = threading.Event()
     httpd = web.serve(cfg, state)
 

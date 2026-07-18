@@ -558,6 +558,51 @@ def run_loop(cfg: Config, state: AppState, stop: threading.Event) -> None:
         stop.wait(cfg.poll_interval)
 
 
+def probe_redirect_uri(candidate: str) -> None:
+    """Log whether the auth server would accept ``candidate`` as a redirect_uri.
+
+    Registered redirect URIs are an exact-match allowlist the provider
+    controls, and they are validated at the authorize endpoint *before* any
+    authentication -- so this is answerable with one unauthenticated request
+    and no login. It matters because an accepted https redirect replaces the
+    whole copy-paste flow with an ordinary callback, and the paste flow is
+    where every failure so far has happened.
+
+    Runs once at startup. Never raises: this is diagnostics, not a dependency.
+    """
+    try:
+        r = httpx.get(
+            f"{AUTH_BASE}/connect/authorize",
+            params={
+                "client_id": CLIENT_ID,
+                "redirect_uri": candidate,
+                "response_type": "code",
+                "scope": SCOPE,
+            },
+            follow_redirects=False,
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"redirect_uri probe for {candidate} could not run: {e}")
+        return
+
+    location = r.headers.get("location", "")
+    body = (r.text or "")[:200]
+    # An unregistered URI is refused outright rather than redirected to, since
+    # redirecting to an unvetted URI is the thing the allowlist exists to stop.
+    rejected = r.status_code >= 400 or "invalid_request" in (location + body)
+    verdict = "REJECTED" if rejected else "ACCEPTED"
+    print(
+        f"redirect_uri probe: {candidate} -> {verdict} "
+        f"(HTTP {r.status_code}{', location=' + location[:120] if location else ''})"
+    )
+    if not rejected:
+        print(
+            "  This redirect is usable. Set VIGILO_REDIRECT_URI to it to replace "
+            "the copy-paste flow with an automatic callback."
+        )
+
+
 def validate(cfg: Config) -> None:
     if not cfg.smtp_to:
         print("ERROR: SMTP_TO not set", file=sys.stderr)
