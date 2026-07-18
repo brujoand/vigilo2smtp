@@ -561,10 +561,14 @@ def run_loop(cfg: Config, state: AppState, stop: threading.Event) -> None:
 def _authorize_probe(candidate: str) -> tuple[bool, str] | None:
     """Ask the authorize endpoint about one redirect_uri.
 
-    Returns (looks_accepted, evidence), or None if the request could not be
-    made. Unauthenticated: registered redirect URIs are an exact-match
-    allowlist validated before any login, precisely so the server never
-    redirects to an unvetted URI.
+    Returns (registered, evidence), or None if the request could not be made.
+
+    The discriminator is a redirect to the login page, established by control:
+    the known-registered custom scheme answers 302 -> /login, while a
+    deliberately bogus URI answers 200 with an error page. Testing for an error
+    *status* does not work here -- this server returns 200 for refusals, which
+    is what made the first version of this probe report the exact opposite of
+    the truth.
     """
     try:
         r = httpx.get(
@@ -583,73 +587,84 @@ def _authorize_probe(candidate: str) -> tuple[bool, str] | None:
         return None
 
     location = r.headers.get("location", "")
-    body = (r.text or "")[:400]
-    rejected = r.status_code >= 400 or "invalid_request" in (location + body)
+    registered = 300 <= r.status_code < 400 and "/login" in location
     evidence = f"HTTP {r.status_code}"
     if location:
-        evidence += f", location={location[:120]}"
-    return (not rejected, evidence)
+        evidence += f", location={location[:100]}"
+    return (registered, evidence)
+
+
+# Redirect URIs worth testing beyond the one we already use. The problem the
+# custom scheme causes is that the OS hands the redirect to the installed
+# Vigilo app, which redeems the single-use code before it can be pasted -- so
+# what matters is finding a registered URI a *browser* can land on.
+#   - the out-of-band URN makes the server display the code on screen, which no
+#     app can intercept; the ideal outcome
+#   - loopback URIs are the standard redirect for native clients and are very
+#     commonly registered alongside a custom scheme
+CANDIDATE_REDIRECTS = (
+    "urn:ietf:wg:oauth:2.0:oob",
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://localhost/callback",
+    "https://localhost/callback",
+)
+
+KNOWN_GOOD_REDIRECT = "app://ch-parent-android.vigilo.no"
+KNOWN_BAD_REDIRECT = "https://redirect-probe-control.invalid/cb"
 
 
 def probe_redirect_uri(candidate: str) -> None:
-    """Decide whether ``candidate`` is a usable redirect_uri, with controls.
+    """Report which redirect URIs this client will accept.
 
-    A bare "the server did not obviously refuse" is not evidence: an error
-    page served with HTTP 200 looks identical to a login page. So the
-    candidate is only reported usable if a deliberately unregistered control
-    URI is refused -- proving the probe can tell the two apart -- and the
-    known-good custom scheme is accepted, proving the request shape is right.
+    Two controls establish that the probe can tell acceptance from rejection at
+    all; without them a uniform response means nothing. Everything else is only
+    interpreted once they agree.
 
     Runs once at startup. Never raises: this is diagnostics, not a dependency.
     """
-    bogus = "https://redirect-probe-control.invalid/cb"
-    results = {
-        name: _authorize_probe(uri)
-        for name, uri in (
-            ("candidate", candidate),
-            ("control-known-good", "app://ch-parent-android.vigilo.no"),
-            ("control-known-bad", bogus),
+    good = _authorize_probe(KNOWN_GOOD_REDIRECT)
+    bad = _authorize_probe(KNOWN_BAD_REDIRECT)
+    if good is None or bad is None:
+        print("redirect_uri probe: could not run")
+        return
+
+    print(f"redirect_uri probe: control-known-good -> {_verdict(good)}")
+    print(f"redirect_uri probe: control-known-bad  -> {_verdict(bad)}")
+    if not good[0] or bad[0]:
+        print(
+            "redirect_uri probe: INCONCLUSIVE -- the controls did not separate, "
+            "so no result below can be trusted."
         )
-    }
-    for name, res in results.items():
+        return
+
+    usable = []
+    for uri in (candidate, *CANDIDATE_REDIRECTS):
+        res = _authorize_probe(uri)
         if res is None:
-            print(f"redirect_uri probe: {name} could not be evaluated")
-            return
-        print(
-            f"redirect_uri probe: {name} -> {'ok' if res[0] else 'refused'} ({res[1]})"
-        )
+            continue
+        print(f"redirect_uri probe: {uri} -> {_verdict(res)}")
+        if res[0]:
+            usable.append(uri)
 
-    cand_ok = results["candidate"][0]
-    good_ok = results["control-known-good"][0]
-    bad_ok = results["control-known-bad"][0]
-
-    if bad_ok:
-        # An unregistered URI was not refused, so "not refused" carries no
-        # information and the candidate's result means nothing either way.
+    if not usable:
         print(
-            "redirect_uri probe: INCONCLUSIVE -- an unregistered control URI was "
-            "also accepted, so this endpoint does not reject at authorize time. "
-            "Do not switch VIGILO_REDIRECT_URI on this evidence."
+            "redirect_uri probe: CONCLUSIVE -- none of the alternatives are "
+            "registered. The custom scheme is the only redirect, so the paste "
+            "flow stays."
         )
         return
-    if not good_ok:
+    print(f"redirect_uri probe: CONCLUSIVE -- also registered: {', '.join(usable)}")
+    if "urn:ietf:wg:oauth:2.0:oob" in usable:
         print(
-            "redirect_uri probe: INCONCLUSIVE -- the known-good custom scheme was "
-            "refused, so the probe request itself is malformed."
+            "  The out-of-band URN is registered: the server shows the code in "
+            "the browser instead of redirecting, so the Vigilo app cannot "
+            "intercept and spend it. Set VIGILO_REDIRECT_URI to it."
         )
-        return
 
-    if cand_ok:
-        print(
-            f"redirect_uri probe: CONCLUSIVE -- {candidate} is registered and "
-            "usable. Set VIGILO_REDIRECT_URI to it to replace the copy-paste "
-            "flow with an automatic callback."
-        )
-    else:
-        print(
-            f"redirect_uri probe: CONCLUSIVE -- {candidate} is not registered. "
-            "The copy-paste flow is required."
-        )
+
+def _verdict(res: tuple[bool, str]) -> str:
+    return f"{'REGISTERED' if res[0] else 'refused'} ({res[1]})"
 
 
 def validate(cfg: Config) -> None:
