@@ -394,6 +394,7 @@ def make_handler(
             fields = parse_qs(raw)
 
             if not csrf.check((fields.get("csrf") or [""])[0]):
+                print("Re-auth rejected: missing or stale CSRF token.")
                 self._page(
                     '<div class="card msg-err">This form expired or did not come '
                     "from this page. Reload and try again.</div>",
@@ -427,6 +428,7 @@ def make_handler(
             if oauth_state:
                 entry = pending.take(oauth_state)
                 if entry is None:
+                    print("Re-auth rejected: unknown or expired state parameter.")
                     self._page(
                         '<div class="card msg-err">Unrecognised or expired login attempt '
                         "(state mismatch). Start over with the button above.</div>",
@@ -449,6 +451,10 @@ def make_handler(
                 response = getattr(e, "response", None)
                 if response is not None:
                     detail = response.text[:400]
+                # The user sees this on the page, but the operator needs it in
+                # the log too -- an exchange that fails silently server-side is
+                # the hardest thing to diagnose remotely.
+                print(f"Re-auth token exchange failed: {e} {detail}")
                 self._page(
                     '<div class="card msg-err"><strong>Token exchange failed.</strong>'
                     f"<br>{html.escape(str(e))}<br><code>{html.escape(detail)}</code>"
@@ -459,6 +465,7 @@ def make_handler(
                 return
 
             if not tokens.get("refresh_token"):
+                print("Re-auth failed: response contained no refresh_token.")
                 self._page(
                     '<div class="card msg-err">Vigilo returned no refresh token. '
                     "The <code>offline_access</code> scope may have been declined.</div>",
