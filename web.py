@@ -33,8 +33,10 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import poller
 
-# A pending authorization is only useful for as long as the login takes.
-PENDING_TTL = 15 * 60
+# The login happens on Vigilo's site, possibly via BankID on a second device,
+# so "as long as the login takes" is not a couple of minutes. 15 was too tight:
+# the form expired while the user was still authenticating.
+PENDING_TTL = 60 * 60
 MAX_PENDING = 5
 # Auth codes are single-use; a double-submitted form would otherwise show a
 # confusing invalid_grant right after a success.
@@ -139,13 +141,21 @@ class PendingAuths:
         self._persist()
         return state, challenge
 
-    def take(self, state: str) -> dict | None:
-        """Consume and return an entry. Codes are single-use, so states are too."""
+    def peek(self, state: str) -> dict | None:
+        """Look up an entry without consuming it."""
         self._prune()
-        entry = self._entries.pop(state, None)
-        if entry:
+        return self._entries.get(state)
+
+    def consume(self, state: str) -> None:
+        """Drop an entry once its code has actually been redeemed.
+
+        Deliberately not done on lookup: if the exchange fails, consuming here
+        would make the *next* attempt fail with a misleading "state mismatch"
+        instead of the real reason, which is how a one-off error turns into a
+        loop the user cannot read their way out of.
+        """
+        if self._entries.pop(state, None) is not None:
             self._persist()
-        return entry
 
     def any_verifier(self) -> str | None:
         """Best-effort verifier for the bare-code path, where no state is known."""
@@ -162,12 +172,23 @@ class CsrfTokens:
     /reauth overwrites the stored credentials, so it must not be reachable by a
     cross-site form auto-submitted from an already-authenticated browser. Any
     authenticating proxy in front of this app authenticates the browser, not the
-    request's origin, so it does not stop that by itself. In memory only -- a
-    restart just means reloading the page.
+    request's origin, so it does not stop that by itself.
+
+    Persisted, for the same reason the pending auths are: the user leaves this
+    page to go and log in elsewhere, and a restart in the meantime (an image
+    bump, a reschedule) would otherwise reject the form they come back to with
+    a misleading "this form expired".
     """
 
-    def __init__(self) -> None:
+    def __init__(self, path) -> None:
+        self._path = path
         self._tokens: dict[str, float] = {}
+        if self._path.exists():
+            try:
+                self._tokens = json.loads(self._path.read_text())
+            except (OSError, ValueError):
+                self._tokens = {}
+        self._prune()
 
     def _prune(self) -> None:
         now = time.time()
@@ -177,17 +198,28 @@ class CsrfTokens:
             if now - created < PENDING_TTL
         }
 
+    def _persist(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(self._tokens))
+        except OSError:
+            pass  # non-fatal: the flow still works within this process
+
     def issue(self) -> str:
         self._prune()
         token = secrets.token_urlsafe(32)
         self._tokens[token] = time.time()
+        self._persist()
         return token
 
     def check(self, token: str) -> bool:
         self._prune()
         # Consumed on use; every rendered page carries a fresh one, so a retry
         # after an error still works.
-        return self._tokens.pop(token, None) is not None
+        ok = self._tokens.pop(token, None) is not None
+        if ok:
+            self._persist()
+        return ok
 
 
 PAGE = """<!doctype html>
@@ -426,7 +458,7 @@ def make_handler(
 
             verifier = None
             if oauth_state:
-                entry = pending.take(oauth_state)
+                entry = pending.peek(oauth_state)
                 if entry is None:
                     print("Re-auth rejected: unknown or expired state parameter.")
                     self._page(
@@ -483,12 +515,16 @@ def make_handler(
                         reauth_notified_at=0,
                     )
             except OSError as e:
+                print(f"Re-auth got tokens but could not persist them: {e}")
                 self._page(
                     '<div class="card msg-err">Got valid tokens but could not '
                     f"write them to disk: {html.escape(str(e))}</div>",
                     500,
                 )
                 return
+
+            if oauth_state:
+                pending.consume(oauth_state)
             print("Re-authentication complete; tokens saved.")
             self._page(
                 '<div class="card msg-ok"><strong>Tokens saved.</strong> '
@@ -500,7 +536,7 @@ def make_handler(
 
 def serve(cfg: poller.Config, state: poller.AppState) -> ThreadingHTTPServer:
     pending = PendingAuths(cfg.token_file.parent / "pending_auth.json")
-    csrf = CsrfTokens()
+    csrf = CsrfTokens(cfg.token_file.parent / "csrf_tokens.json")
     port = int(os.environ.get("HTTP_PORT", "8080"))
     handler = make_handler(cfg, state, pending, csrf)
     return ThreadingHTTPServer(("", port), handler)
