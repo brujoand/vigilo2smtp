@@ -11,12 +11,46 @@ Vigilo refresh tokens expire every 30-90 days. When that happens the poller
 emails you, pauses polling, and waits &mdash; it does not crash. Open the UI and
 redo the login.
 
-> **Use desktop Firefox, not a phone.**
-> The OAuth client is Vigilo's Android app and its registered redirect URI is
-> the custom scheme `app://ch-parent-android.vigilo.no`. No browser can follow
-> that, which is the whole reason this is a copy-paste flow rather than an
-> ordinary callback. On a phone the installed Vigilo app intercepts the redirect
-> and swallows the code, so the flow cannot be completed at all.
+### The problem this flow works around
+
+The OAuth client is Vigilo's Android app, and its registered redirect URI is the
+custom scheme `app://ch-parent-android.vigilo.no`. No browser can follow that,
+so this cannot be an ordinary callback.
+
+Worse, if Vigilo's own application is installed on the machine you log in from,
+**the OS hands it the redirect and it redeems the authorization code**.
+Authorization codes are single-use, so by the time you try to use it the code is
+already spent and the exchange fails with `invalid_grant` &mdash; no matter how
+quickly you work. Codes themselves are not the constraint; one has been redeemed
+successfully 168 seconds after the login started.
+
+So the goal is simply to make sure *you* receive the redirect, not that app.
+
+### Recommended: install the redirect handler (Linux/XDG)
+
+```bash
+./contrib/install-redirect-handler.sh https://your-ui.example.com
+```
+
+This claims `x-scheme-handler/app` for the desktop, so the redirect comes to you
+first. Re-authenticating then takes two clicks:
+
+1. Open the UI, click **Log in to Vigilo**, complete the login.
+2. The handler opens the UI with the code filled in. Click **Save tokens**.
+
+The handler never submits on your behalf &mdash; it opens `/paste`, which
+validates the `state` against a pending login and renders the form for you to
+confirm. If `xdg-open` is unavailable it copies the URL to the clipboard, and
+failing that writes it to `/tmp/vigilo_code`.
+
+Note this takes the `app://` scheme over from Vigilo's application if it is
+installed. To give it back: `xdg-mime default <their>.desktop
+x-scheme-handler/app`.
+
+### Manual fallback
+
+On a machine with **no Vigilo application installed**, the redirect simply fails
+and the URL stays in the address bar:
 
 1. Open the UI and click **Log in to Vigilo**.
 2. Complete the login.
@@ -25,13 +59,14 @@ redo the login.
    success case.**
 4. Copy the whole failed URL from the address bar and paste it into the form.
 
-Firefox keeps that URL in the address bar. Chrome and Safari frequently clear
-it &mdash; if that happens, open DevTools &rarr; Network and tick **Preserve
-log** *before* step 1, then read the failed `app://` request from the log. The
-form also accepts a bare `code` value.
+Firefox keeps that URL in the address bar; Chrome and Safari frequently clear
+it. Where the app *is* installed, or the address bar is lost, open DevTools
+&rarr; Network and tick **Preserve log** *before* step 1 &mdash; the failed
+`app://` request stays in the log with its full query string, and is visible
+even though the OS handed it off. The form also accepts a bare `code` value.
 
-Auth codes expire in about a minute and work only once. If you are too slow you
-get `invalid_grant`; just start over.
+Codes are single-use. If one fails, start a completely fresh login rather than
+retrying the same URL.
 
 ### If Vigilo ever registers an https redirect
 
@@ -43,6 +78,7 @@ automatic flow and the copy-paste step disappears. No code change needed.
 | Path | Purpose |
 |---|---|
 | `GET /` | Status page, login link, paste form |
+| `GET /paste` | Form pre-filled from a captured redirect; validates `state`, never submits |
 | `POST /reauth` | Exchange a pasted code or redirect URL |
 | `GET /oauth/callback` | Automatic callback (https redirect only) |
 | `GET /healthz` | Liveness &mdash; 200 whenever the server is serving |

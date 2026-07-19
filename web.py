@@ -288,7 +288,7 @@ the redirect and swallow the code.</p>
 
 <form method="post" action="/reauth">
   <input type="hidden" name="csrf" value="{csrf}">
-  <input type="text" name="redirect_url" autofocus
+  <input type="text" name="redirect_url" autofocus value="{prefill}"
          placeholder="app://ch-parent-android.vigilo.no?code=..." >
   <button type="submit">Save tokens</button>
 </form>
@@ -305,13 +305,18 @@ the redirect and swallow the code.</p>
 
 
 def render_page(
-    state: poller.AppState, authorize_url: str, csrf: str, message: str = ""
+    state: poller.AppState,
+    authorize_url: str,
+    csrf: str,
+    message: str = "",
+    prefill: str = "",
 ) -> bytes:
     snap = state.snapshot()
     needs_reauth = bool(snap.get("needs_reauth"))
     body = PAGE.format(
         message=message,
         csrf=html.escape(csrf, quote=True),
+        prefill=html.escape(prefill, quote=True),
         health_class="bad" if needs_reauth else "ok",
         state_text=(
             "Re-authentication required &mdash; polling is paused"
@@ -374,11 +379,53 @@ def make_handler(
                 f"{urlencode(params, quote_via=quote)}"
             )
 
-        def _page(self, message: str = "", code: int = 200) -> None:
+        def _page(self, message: str = "", code: int = 200, prefill: str = "") -> None:
             self._send(
                 code,
-                render_page(state, self._authorize_url(), csrf.issue(), message),
+                render_page(
+                    state, self._authorize_url(), csrf.issue(), message, prefill
+                ),
                 "text/html; charset=utf-8",
+            )
+
+        def _handle_paste(self) -> None:
+            """Render the form pre-filled from a captured redirect.
+
+            The desktop URI handler (see contrib/) opens this after the OS hands
+            it the app:// redirect, so the code travels straight from the
+            handler to an already-authenticated browser tab.
+
+            Deliberately renders rather than submits. A GET must not change
+            state, and requiring the click means a crafted link cannot bind
+            this poller to someone else's account on its own. The state check
+            below is the real guard; the click is defence in depth.
+            """
+            query = parse_qs(urlparse(self.path).query)
+            code = (query.get("code") or [""])[0]
+            oauth_state = (query.get("state") or [""])[0]
+
+            if not code:
+                self._page(
+                    '<div class="card msg-err">That link carried no code.</div>', 400
+                )
+                return
+            if not oauth_state or pending.peek(oauth_state) is None:
+                # Without a matching state this is either a stale capture or a
+                # code someone else obtained. Refuse rather than pre-fill it.
+                print("Captured redirect rejected: unknown or expired state.")
+                self._page(
+                    '<div class="card msg-err">That captured login is unrecognised '
+                    "or has expired. Start a fresh login with the button "
+                    "above.</div>",
+                    400,
+                )
+                return
+
+            print("Captured redirect received; awaiting confirmation.")
+            self._page(
+                '<div class="card msg-ok"><strong>Code captured.</strong> '
+                "Click <em>Save tokens</em> to finish signing in.</div>",
+                prefill=self.path.split("?", 1)[-1],
             )
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -403,6 +450,8 @@ def make_handler(
                 )
             elif path == "/oauth/callback":
                 self._handle_callback()
+            elif path == "/paste":
+                self._handle_paste()
             elif path == "/":
                 self._page()
             elif path == "/reauth":
